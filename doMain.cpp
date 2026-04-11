@@ -4,12 +4,17 @@
 #include "flip_clock.h"
 #include "home_bg_sd_assets.h"
 #include "mic_remote_client.h"
+#include "net_worker.h"
+#include "power_manager.h"
 #include "radio_vendor.h"
 #include "sd_vendor.h"
 #include "speaker_tone.h"
 #include "stt_cloud.h"
 #include "voice_command_ids.h"
 #include "voice_command_parser.h"
+#include "wake_logic.h"
+#include "wifi_manager.h"
+#include "wifi_ui_controller.h"
 #include "weather_sd_assets.h"
 #include "weather_visuals.h"
 #include "ui_helpers.h"
@@ -42,7 +47,6 @@ LV_IMG_DECLARE(ui_img_settings_mic_png);
 
 #include <Preferences.h>
 #include <SD.h>
-#include <WiFiClientSecure.h>
 #include <img_converters.h>
 #include <ctype.h>
 #include <esp_heap_caps.h>
@@ -238,9 +242,8 @@ static constexpr uint32_t kDonorEqBaud = 115200;
 static HardwareSerial gDonorEqSerial(1);
 static uint8_t gDonorEqSeq = 0;
 static constexpr bool kDonorWakeGpioEnabled = false;
-static constexpr int kDonorWakeGpioInPin = 44; // H1 pin4 (U0RXD)
+static constexpr int kDonorWakeGpioInPin = 44; // P2 pin 1 (U0RXD)
 static constexpr uint32_t kDonorWakeHoldMs = 1500;
-static uint32_t gDonorWakeHoldUntilMs = 0;
 static lv_obj_t *g_boot_black_screen = NULL;
 static bool g_boot_black_active = false;
 static bool g_boot_wait_wifi_on_start = false;
@@ -401,7 +404,6 @@ static void ensure_weather_task_running();
 static bool fetch_weather_once_now();
 static void donor_eq_uart_init();
 static void donor_eq_uart_push(const uint8_t *bars, size_t count, bool active);
-static bool donor_wake_gpio_active();
 static SdVoiceMode current_voice_mode();
 static void begin_tap_listen();
 static void stop_tap_listen(bool remote_stop = true);
@@ -1591,46 +1593,29 @@ static void enable_home_gesture_bubble()
     lv_obj_move_foreground(g_home_gesture_layer);
 }
 
-static String current_wifi_text()
-{
-    if (WiFi.status() != WL_CONNECTED)
-    {
-        return "WiFi: offline";
-    }
-    String name = WiFi.SSID();
-    if (name.length() == 0)
-    {
-        return "WiFi: connected";
-    }
-    if (name.length() > 18)
-    {
-        name = name.substring(0, 18) + "...";
-    }
-    return "WiFi: " + name;
-}
-
 static void load_saved_wifi_credentials()
 {
-    if (!g_prefs.begin("wifi", true))
+    WifiManagerStoredSettings settings;
+    if (!wifi_manager_load_preferences(g_prefs, &settings))
     {
         Serial.println("[wifi] prefs open failed (read)");
         return;
     }
 
-    ssid = g_prefs.getString("ssid", "");
-    pswd = g_prefs.getString("pswd", "");
-    g_city_query = g_prefs.getString("city", "");
-    g_weather_saved_lat = g_prefs.getFloat("wlat", 0.0f);
-    g_weather_saved_lon = g_prefs.getFloat("wlon", 0.0f);
-    g_voice_command_language = static_cast<VoiceCommandLanguage>(g_prefs.getUChar("vcmd_lang", static_cast<uint8_t>(VOICE_LANG_EN)));
+    ssid = settings.ssid;
+    pswd = settings.password;
+    g_city_query = settings.city_query;
+    g_weather_saved_lat = settings.weather_saved_lat;
+    g_weather_saved_lon = settings.weather_saved_lon;
+    g_voice_command_language = static_cast<VoiceCommandLanguage>(settings.voice_command_language);
     if (g_voice_command_language != VOICE_LANG_EN && g_voice_command_language != VOICE_LANG_PT_PT)
     {
         g_voice_command_language = VOICE_LANG_EN;
     }
-    g_alarm_enabled = g_prefs.getBool("alarm_on", false);
-    g_alarm_hour = g_prefs.getUChar("alarm_h", 7);
-    g_alarm_minute = g_prefs.getUChar("alarm_m", 0);
-    g_alarm_melody = g_prefs.getUChar("alarm_tone", 1);
+    g_alarm_enabled = settings.alarm_enabled;
+    g_alarm_hour = settings.alarm_hour;
+    g_alarm_minute = settings.alarm_minute;
+    g_alarm_melody = settings.alarm_melody;
     if (g_alarm_hour > 23)
     {
         g_alarm_hour = 7;
@@ -1643,7 +1628,6 @@ static void load_saved_wifi_credentials()
     {
         g_alarm_melody = 1;
     }
-    g_prefs.end();
 
     if (ssid.length() > 0)
     {
@@ -1664,73 +1648,40 @@ static void save_wifi_credentials()
         g_city_query.trim();
     }
 
-    if (!g_prefs.begin("wifi", false))
+    WifiManagerStoredSettings settings;
+    settings.ssid = ssid;
+    settings.password = pswd;
+    settings.city_query = g_city_query;
+    settings.weather_saved_lat = g_weather_saved_lat;
+    settings.weather_saved_lon = g_weather_saved_lon;
+    settings.voice_command_language = static_cast<uint8_t>(g_voice_command_language);
+    settings.alarm_enabled = g_alarm_enabled;
+    settings.alarm_hour = g_alarm_hour;
+    settings.alarm_minute = g_alarm_minute;
+    settings.alarm_melody = g_alarm_melody;
+
+    if (!wifi_manager_save_preferences(g_prefs, &settings))
     {
         Serial.println("[wifi] prefs open failed (write)");
         return;
     }
 
-    // Never erase working WiFi credentials when unrelated settings are saved.
-    String ssidToSave = ssid;
-    String pswdToSave = pswd;
-    if (!ssidToSave.length() || !pswdToSave.length())
+    if (ssid != settings.ssid)
     {
-        const String storedSsid = g_prefs.getString("ssid", "");
-        const String storedPswd = g_prefs.getString("pswd", "");
-        if (!ssidToSave.length() && storedSsid.length())
-        {
-            ssidToSave = storedSsid;
-        }
-        if (!pswdToSave.length() && storedPswd.length())
-        {
-            pswdToSave = storedPswd;
-        }
+        ssid = settings.ssid;
     }
-
-    g_prefs.putString("ssid", ssidToSave);
-    g_prefs.putString("pswd", pswdToSave);
-    g_prefs.putString("city", g_city_query);
-    g_prefs.putFloat("wlat", g_weather_saved_lat);
-    g_prefs.putFloat("wlon", g_weather_saved_lon);
-    g_prefs.putUChar("vcmd_lang", static_cast<uint8_t>(g_voice_command_language));
-    g_prefs.putBool("alarm_on", g_alarm_enabled);
-    g_prefs.putUChar("alarm_h", g_alarm_hour);
-    g_prefs.putUChar("alarm_m", g_alarm_minute);
-    g_prefs.putUChar("alarm_tone", g_alarm_melody);
-    g_prefs.end();
-    if (ssid != ssidToSave)
+    if (pswd != settings.password)
     {
-        ssid = ssidToSave;
-    }
-    if (pswd != pswdToSave)
-    {
-        pswd = pswdToSave;
+        pswd = settings.password;
     }
     Serial.println("[wifi] credentials saved");
-}
-
-static void wifi_textarea_focus_cb(lv_event_t *e)
-{
-    if (lv_event_get_code(e) != LV_EVENT_FOCUSED)
-    {
-        return;
-    }
-
-    lv_obj_t *target = lv_event_get_target(e);
-    if (ui_Keyboard4 && target)
-    {
-        lv_keyboard_set_textarea(ui_Keyboard4, target);
-    }
 }
 
 static void setup_wifi_city_input()
 {
     if (g_city_textarea)
     {
-        if (g_city_query.length() > 0)
-        {
-            lv_textarea_set_text(g_city_textarea, g_city_query.c_str());
-        }
+        wifi_ui_apply_saved_city_text(g_city_textarea, g_city_query);
         return;
     }
 
@@ -1757,12 +1708,8 @@ static void setup_wifi_city_input()
     lv_textarea_set_one_line(g_city_textarea, true);
     lv_textarea_set_password_mode(g_city_textarea, false);
     lv_obj_set_style_text_font(g_city_textarea, &lv_font_montserrat_20, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_add_event_cb(g_city_textarea, wifi_textarea_focus_cb, LV_EVENT_FOCUSED, NULL);
-
-    if (g_city_query.length() > 0)
-    {
-        lv_textarea_set_text(g_city_textarea, g_city_query.c_str());
-    }
+    lv_obj_add_event_cb(g_city_textarea, wifi_ui_textarea_focus_cb, LV_EVENT_FOCUSED, ui_Keyboard4);
+    wifi_ui_apply_saved_city_text(g_city_textarea, g_city_query);
 
     create_home_shortcut(ui_Screen2);
 }
@@ -1805,23 +1752,20 @@ static bool getCityPositionByName(const String &cityName, float &latValue, float
         return false;
     }
 
-    HTTPClient httpClient;
     const String url = "http://geocoding-api.open-meteo.com/v1/search?name=" + url_encode_component(cityName) + "&count=1&language=en&format=json";
-    if (!httpClient.begin(url))
-    {
-        return false;
-    }
-
-    const int httpCode = httpClient.GET();
+    String payload;
+    NetWorkerHttpOptions net_opts;
+    net_opts.insecure_tls = false;
+    net_opts.connect_timeout_ms = 5000;
+    net_opts.timeout_ms = 7000;
+    const int httpCode = net_worker_http_get(url, &payload, &net_opts);
     if (httpCode != HTTP_CODE_OK)
     {
-        httpClient.end();
         return false;
     }
 
     DynamicJsonDocument doc(2048);
-    const DeserializationError err = deserializeJson(doc, httpClient.getString());
-    httpClient.end();
+    const DeserializationError err = deserializeJson(doc, payload);
     if (err)
     {
         return false;
@@ -1981,28 +1925,22 @@ static bool fetch_country_holiday_text(int year, int month, int day, const Strin
         return false;
     }
 
-    WiFiClientSecure wifiClient;
-    wifiClient.setInsecure();
-
     auto fetchHolidayYear = [&](int queryYear, String &bestText, bool &foundToday, time_t &bestWhen) -> bool
     {
-        HTTPClient httpClient;
         const String url = String("https://date.nager.at/api/v3/PublicHolidays/") + String(queryYear) + "/" + code;
-        if (!httpClient.begin(wifiClient, url))
-        {
-            return false;
-        }
-        httpClient.setTimeout(6000);
-        const int httpCode = httpClient.GET();
+        String payload;
+        NetWorkerHttpOptions net_opts;
+        net_opts.insecure_tls = true;
+        net_opts.connect_timeout_ms = 5000;
+        net_opts.timeout_ms = 6000;
+        const int httpCode = net_worker_http_get(url, &payload, &net_opts);
         if (httpCode != HTTP_CODE_OK)
         {
-            httpClient.end();
             return false;
         }
 
         DynamicJsonDocument doc(24576);
-        const DeserializationError err = deserializeJson(doc, httpClient.getString());
-        httpClient.end();
+        const DeserializationError err = deserializeJson(doc, payload);
         if (err || !doc.is<JsonArray>())
         {
             return false;
@@ -2729,7 +2667,7 @@ void ui_sync_runtime()
         g_boot_wait_wifi_on_start = false;
         g_boot_black_active = false;
         save_wifi_credentials();
-        lv_label_set_text(ui_Label12, "Success");
+        lv_label_set_text(ui_Label12, wifi_ui_status_connect_success());
         _ui_screen_change(&ui_Screen1, LV_SCR_LOAD_ANIM_FADE_ON, 500, 0, &ui_Screen1_screen_init);
         update_all_shell_labels();
         if (!g_time_task_started)
@@ -2750,7 +2688,7 @@ void ui_sync_runtime()
         }
         g_weather_ready = false;
         g_weather_dirty = true;
-        lv_label_set_text(ui_Label12, "Failed");
+        lv_label_set_text(ui_Label12, wifi_ui_status_connect_failed());
         lv_obj_clear_flag(ui_Button1, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(ui_Button2, LV_OBJ_FLAG_HIDDEN);
         g_wifi_connect_state = 0;
@@ -2881,165 +2819,60 @@ static bool media_output_active()
     return radio_vendor_is_playing() || sd_vendor_is_busy();
 }
 
-static bool donor_wake_gpio_active()
-{
-    if (!kDonorWakeGpioEnabled)
-    {
-        return false;
-    }
-    const uint32_t now = millis();
-    const int level = digitalRead(kDonorWakeGpioInPin);
-    if (level == HIGH)
-    {
-        gDonorWakeHoldUntilMs = now + kDonorWakeHoldMs;
-        return true;
-    }
-    return now < gDonorWakeHoldUntilMs;
-}
-
 static bool mic_sound_above_wake_level()
 {
-    if (g_system_soft_off || media_output_active())
-    {
-        return false;
-    }
-    if (donor_wake_gpio_active())
-    {
-        return true;
-    }
-    if (!kDonorSoundWakeEnabled || !mic_remote_client_online())
-    {
-        return false;
-    }
-
-    static uint32_t s_eq_avg_rms = 0;
-    const uint32_t floor = mic_remote_client_noise_floor();
-    const uint32_t gate = mic_remote_client_gate_on();
-    const uint32_t rmsRaw = mic_remote_client_rms();
-    const uint32_t rms = mic_remote_client_rms_smooth();
-    const uint32_t peak = mic_remote_client_peak();
-
-    if (s_eq_avg_rms == 0)
-    {
-        s_eq_avg_rms = rms;
-    }
-    else
-    {
-        s_eq_avg_rms = (s_eq_avg_rms * 7UL + rms) / 8UL;
-    }
-    if (s_eq_avg_rms < floor)
-    {
-        s_eq_avg_rms = floor;
-    }
-
-    uint32_t threshold = s_eq_avg_rms + (g_display_sleeping ? 35UL : 55UL);
-    if (gate > floor + 12UL)
-    {
-        const uint32_t gateThreshold = floor + ((gate - floor) * 45UL) / 100UL;
-        if (gateThreshold < threshold)
-        {
-            threshold = gateThreshold;
-        }
-    }
-    const uint32_t floorThreshold = floor + 60UL;
-    if (threshold < floorThreshold)
-    {
-        threshold = floorThreshold;
-    }
-
-    if (g_display_sleeping && threshold > floor + 50UL)
-    {
-        threshold -= 10UL;
-    }
-
-    uint32_t peakThreshold = threshold + 60UL;
-    const uint32_t minPeakThreshold = floor + 120UL;
-    if (peakThreshold < minPeakThreshold)
-    {
-        peakThreshold = minPeakThreshold;
-    }
-    if (mic_remote_client_voice())
-    {
-        return true;
-    }
-
-    const bool rmsCandidate = rms >= threshold;
-    const bool peakCandidate = peak >= peakThreshold;
-    if (peakCandidate && !rmsCandidate)
-    {
-        uint32_t peakRmsGuard = floor + 30UL;
-        if (gate > floor + 8UL)
-        {
-            const uint32_t gateGuard = floor + ((gate - floor) * 25UL) / 100UL;
-            if (gateGuard > peakRmsGuard)
-            {
-                peakRmsGuard = gateGuard;
-            }
-        }
-        if (rms < peakRmsGuard && rmsRaw < (peakRmsGuard + 20UL))
-        {
-            return false;
-        }
-    }
-
-    return rmsCandidate || peakCandidate;
+    WakeLogicInputs in;
+    in.donor_wake_enabled = kDonorWakeGpioEnabled;
+    in.donor_gpio_high = (digitalRead(kDonorWakeGpioInPin) == HIGH);
+    in.now_ms = millis();
+    in.donor_wake_hold_ms = kDonorWakeHoldMs;
+    in.system_soft_off = g_system_soft_off;
+    in.media_output_active = media_output_active();
+    in.donor_sound_wake_enabled = kDonorSoundWakeEnabled;
+    in.mic_online = mic_remote_client_online();
+    in.mic_voice = mic_remote_client_voice();
+    in.display_sleeping = g_display_sleeping;
+    in.noise_floor = mic_remote_client_noise_floor();
+    in.gate_on = mic_remote_client_gate_on();
+    in.rms_raw = mic_remote_client_rms();
+    in.rms_smooth = mic_remote_client_rms_smooth();
+    in.peak = mic_remote_client_peak();
+    return wake_logic_update(in);
 }
 
 static void refresh_display_sleep_state()
 {
-    const uint32_t now = millis();
-    if (g_last_user_activity_ms == 0)
+    const int16_t level = power_manager_refresh(
+        millis(),
+        &g_last_user_activity_ms,
+        &g_last_sound_activity_ms,
+        &g_display_wake_hold_until_ms,
+        &g_display_sleeping,
+        g_system_soft_off,
+        g_alarm_ringing,
+        mic_sound_above_wake_level(),
+        kDisplaySleepIdleMs,
+        kDisplaySleepWakeHoldMs,
+        g_backlight,
+        kDisplaySleepBrightness,
+        kSystemSoftOffBrightness);
+    if (level >= 0)
     {
-        g_last_user_activity_ms = now;
-        g_last_sound_activity_ms = now;
-    }
-
-    if (g_system_soft_off)
-    {
-        g_display_sleeping = false;
-        g_display_wake_hold_until_ms = 0;
-        apply_runtime_backlight(kSystemSoftOffBrightness);
-        return;
-    }
-
-    const bool alarmActive = g_alarm_ringing;
-    const bool micActive = mic_sound_above_wake_level();
-
-    if (alarmActive || micActive)
-    {
-        g_last_sound_activity_ms = now;
-        g_display_wake_hold_until_ms = now + kDisplaySleepWakeHoldMs;
-        if (g_display_sleeping)
-        {
-            g_display_sleeping = false;
-            apply_runtime_backlight(g_backlight);
-        }
-        return;
-    }
-
-    if (now < g_display_wake_hold_until_ms)
-    {
-        return;
-    }
-    const uint32_t lastActivity = (g_last_user_activity_ms > g_last_sound_activity_ms) ? g_last_user_activity_ms : g_last_sound_activity_ms;
-    if (!g_display_sleeping && (now - lastActivity) >= kDisplaySleepIdleMs)
-    {
-        g_display_sleeping = true;
-        apply_runtime_backlight(kDisplaySleepBrightness);
+        apply_runtime_backlight(static_cast<uint8_t>(level));
     }
 }
 
 static void note_user_activity()
 {
-    g_last_user_activity_ms = millis();
-    if (g_system_soft_off)
+    const int16_t level = power_manager_note_user_activity(
+        millis(),
+        g_system_soft_off,
+        &g_last_user_activity_ms,
+        &g_display_sleeping,
+        g_backlight);
+    if (level >= 0)
     {
-        return;
-    }
-    if (g_display_sleeping)
-    {
-        g_display_sleeping = false;
-        apply_runtime_backlight(g_backlight);
+        apply_runtime_backlight(static_cast<uint8_t>(level));
     }
     schedule_next_ambient(false);
 }
@@ -6404,7 +6237,7 @@ static void create_settings_media_button()
 void do_main_ui_init(void)
 {
     lv_keyboard_set_textarea(ui_Keyboard4, ui_TextArea1);
-    lv_obj_add_event_cb(ui_TextArea1, wifi_textarea_focus_cb, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(ui_TextArea1, wifi_ui_textarea_focus_cb, LV_EVENT_FOCUSED, ui_Keyboard4);
     setup_wifi_city_input();
     lv_obj_add_event_cb(ui_Button2, ui_event_Button_scan, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ui_Keyboard4, ui_event_Key_Ok, LV_EVENT_READY, NULL);
@@ -6498,6 +6331,7 @@ void do_main_ui_init(void)
 void init_light()
 {
     Serial.println("[wxfix] init_light enter");
+    wake_logic_reset();
     if (kDonorWakeGpioEnabled)
     {
         pinMode(kDonorWakeGpioInPin, INPUT_PULLDOWN);
@@ -6505,6 +6339,7 @@ void init_light()
     donor_eq_uart_init();
     audio_visualizer_init();
     mic_remote_client_init();
+    net_worker_begin(1, 1);
     radio_vendor_init();
     sd_vendor_init();
     weather_visuals_init();
@@ -6753,17 +6588,13 @@ void ui_event_Button_scan(lv_event_t *e)
     {
         note_user_activity();
         play_ui_click();
-        lv_label_set_text(ui_Label12, "Scan...");
+        lv_label_set_text(ui_Label12, wifi_ui_status_scanning());
         WiFi.disconnect(false, false);
         delay(150);
         WiFi.scanDelete();
         wifi_nums = scanNetworks();
         Serial.println(wifi_nums);
-        String wifi_name = "";
-        if (wifi_nums <= 0)
-        {
-            wifi_name = "No networks found";
-        }
+        String wifi_name = wifi_ui_networks_to_dropdown_options(wifi_nums);
         for (int i = 0; i < wifi_nums; i++)
         {
             Serial.print(i);
@@ -6774,19 +6605,10 @@ void ui_event_Button_scan(lv_event_t *e)
             Serial.print(" ");
             Serial.print(transEncryptionType(WiFi.encryptionType(i)));
             Serial.println("");
-            if (i < wifi_nums - 1)
-            {
-                wifi_name += WiFi.SSID(i);
-                wifi_name += "\n";
-            }
-            else
-            {
-                wifi_name += WiFi.SSID(i);
-            }
         }
         lv_dropdown_set_options(ui_Dropdown2, wifi_name.c_str());
         lv_dropdown_set_selected(ui_Dropdown2, 0);
-        lv_label_set_text(ui_Label12, wifi_nums > 0 ? "Please connect to WiFi" : "No WiFi found");
+        lv_label_set_text(ui_Label12, wifi_ui_status_after_scan(wifi_nums));
     }
 }
 
@@ -6797,49 +6619,7 @@ void scan_wifi_task(void *pvParameters)
 
 void connect_wifi_task(void *pvParameters)
 {
-    g_wifi_connect_state = 1;
-    bool connected = false;
-    WiFi.setAutoReconnect(true);
-    WiFi.setSleep(false);
-    WiFi.persistent(false);
-    if (ssid.length() == 0)
-    {
-        Serial.println("[wifi] empty ssid, skip connect");
-        g_wifi_connect_state = 3;
-        vTaskDelete(NULL);
-    }
-    for (int attempt = 0; attempt < 1 && !connected; ++attempt)
-    {
-        WiFi.mode(WIFI_STA);
-        WiFi.disconnect(false, false);
-        delay(120);
-        WiFi.begin(ssid.c_str(), pswd.c_str());
-
-        const uint32_t waitStarted = millis();
-        while (WiFi.status() != WL_CONNECTED)
-        {
-            delay(250);
-            Serial.print(".");
-            if ((millis() - waitStarted) > 12000UL)
-            {
-                break;
-            }
-        }
-        connected = (WiFi.status() == WL_CONNECTED);
-    }
-    if (connected)
-    {
-        Serial.println("WiFi connected");
-        Serial.println("IP address: ");
-        Serial.println(WiFi.localIP());
-        g_wifi_connect_state = 2;
-    }
-    else
-    {
-        Serial.printf("WiFi connect failed, status=%d\n", static_cast<int>(WiFi.status()));
-        g_wifi_connect_state = 3;
-    }
-    ensure_panel_link_ap();
+    wifi_manager_connect_blocking(ssid, pswd, &g_wifi_connect_state, ensure_panel_link_ap);
     vTaskDelete(NULL);
 }
 
@@ -6849,41 +6629,30 @@ const char *timeZone = "EET-2EEST,M3.5.0/3,M10.5.0/4";
 
 void getNtpTime(void *pvParameters)
 {
-    configTime(0, 0, ntpServer, ntpServer2);
-    setenv("TZ", timeZone, 1);
-    tzset();
-
-    time_t now_ts = time(nullptr);
-    int attempts = 0;
-    while (now_ts < 100000 && attempts < 30)
-    {
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-        now_ts = time(nullptr);
-        attempts++;
-    }
-    NTPState = now_ts >= 100000;
+    wifi_manager_ntp_begin(ntpServer, ntpServer2, timeZone);
+    NTPState = wifi_manager_ntp_wait_initial_sync(30, 500);
     Serial.println(NTPState ? "time sync ok" : "time sync pending");
 
     for (;;)
     {
-        time_t t = time(nullptr);
-        const bool ntpNow = t >= 100000;
+        WifiManagerTimeSnapshot snap;
+        wifi_manager_ntp_read_time(&snap);
+
+        const bool ntpNow = snap.ntp_synced;
         if (ntpNow != NTPState)
         {
             NTPState = ntpNow;
             Serial.println(NTPState ? "time sync ok" : "time sync pending");
         }
-        struct tm timeinfo;
-        localtime_r(&t, &timeinfo);
 
-        currentTime_year = timeinfo.tm_year + 1900;
-        currentTime_mouth = timeinfo.tm_mon + 1;
-        currentTime_day = timeinfo.tm_mday;
-        currentTime_hour = timeinfo.tm_hour;
-        currentTime_minute = timeinfo.tm_min;
-        currentTime_second = timeinfo.tm_sec;
-        currentTime_week = timeinfo.tm_wday;
-        timeNow = (unsigned long)t;
+        currentTime_year = snap.year;
+        currentTime_mouth = snap.month;
+        currentTime_day = snap.day;
+        currentTime_hour = snap.hour;
+        currentTime_minute = snap.minute;
+        currentTime_second = snap.second;
+        currentTime_week = snap.weekday;
+        timeNow = snap.unix_time;
         if (currentTime_hour <= 9)
         {
             hourText = "0" + String(currentTime_hour);
@@ -6921,7 +6690,7 @@ void getNtpTime(void *pvParameters)
             dayText = String(currentTime_day);
         }
         topDateText = yearText + "/" + mouthText + "/" + dayText;
-        g_clock_timezone_text = (timeinfo.tm_isdst > 0) ? "Kyiv time - EEST" : "Kyiv time - EET";
+        g_clock_timezone_text = snap.is_dst ? "Kyiv time - EEST" : "Kyiv time - EET";
 
         topTimeText = hourText + ":" + minuteText;
 
@@ -7008,7 +6777,7 @@ void ui_event_Key_Ok(lv_event_t *e)
         }
 
         lv_obj_add_flag(ui_Button2, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(ui_Label12, "Connect...");
+        lv_label_set_text(ui_Label12, wifi_ui_status_connecting());
         lv_obj_clear_state(ui_TextArea1, LV_STATE_FOCUSED);
 
         char buf[32];
@@ -7030,27 +6799,25 @@ void ui_event_Key_Ok(lv_event_t *e)
         if (taskOk != pdPASS)
         {
             g_wifi_connect_state = 0;
-            lv_label_set_text(ui_Label12, "Connect failed");
+            lv_label_set_text(ui_Label12, wifi_ui_status_connect_task_failed());
         }
     }
 }
 
 String getIps(void)
 {
-    HTTPClient httpClient;
     String ip = "";
     const char *url = "http://ip-api.com/json/?fields=query";
-
-    if (!httpClient.begin(url))
-    {
-        return ip;
-    }
-
-    int httpCode = httpClient.GET();
+    String payload;
+    NetWorkerHttpOptions net_opts;
+    net_opts.insecure_tls = false;
+    net_opts.connect_timeout_ms = 4000;
+    net_opts.timeout_ms = 5000;
+    int httpCode = net_worker_http_get(url, &payload, &net_opts);
     if (httpCode == HTTP_CODE_OK)
     {
         DynamicJsonDocument doc(256);
-        if (deserializeJson(doc, httpClient.getString()) == DeserializationError::Ok)
+        if (deserializeJson(doc, payload) == DeserializationError::Ok)
         {
             ip = doc["query"].as<String>();
         }
@@ -7059,8 +6826,6 @@ String getIps(void)
     {
         Serial.printf("[weather] ip lookup failed: %d\n", httpCode);
     }
-
-    httpClient.end();
     return ip;
 }
 
@@ -7070,9 +6835,6 @@ float *getCityPosition(String ips)
     position[0] = 0.0f;
     position[1] = 0.0f;
 
-    HTTPClient httpClient;
-    httpClient.setTimeout(5000);
-
     String url = "http://ip-api.com/json";
     if (ips.length() > 0)
     {
@@ -7080,16 +6842,16 @@ float *getCityPosition(String ips)
     }
     url += "?fields=status,lat,lon,city,country,countryCode";
 
-    if (!httpClient.begin(url))
-    {
-        return position;
-    }
-
-    int httpCode = httpClient.GET();
+    String payload;
+    NetWorkerHttpOptions net_opts;
+    net_opts.insecure_tls = false;
+    net_opts.connect_timeout_ms = 4000;
+    net_opts.timeout_ms = 5000;
+    int httpCode = net_worker_http_get(url, &payload, &net_opts);
     if (httpCode == HTTP_CODE_OK)
     {
         DynamicJsonDocument doc(512);
-        if (deserializeJson(doc, httpClient.getString()) == DeserializationError::Ok &&
+        if (deserializeJson(doc, payload) == DeserializationError::Ok &&
             doc["status"].as<String>() == "success")
         {
             position[0] = doc["lat"].as<float>();
@@ -7105,8 +6867,6 @@ float *getCityPosition(String ips)
     {
         Serial.printf("[weather] geo lookup failed: %d\n", httpCode);
     }
-
-    httpClient.end();
     return position;
 }
 
@@ -7206,29 +6966,22 @@ static int map_wttr_code_to_visual_code(int wttrCode)
 static bool fetch_open_meteo_weather(float latValue, float lonValue, String &summary, String &tempText,
                                      String &windText, String &humidityText, int &weatherCodeOut, bool &isDayOut)
 {
-    HTTPClient httpClient;
     String url = "http://wttr.in/" + String(latValue, 4) + "," + String(lonValue, 4) + "?format=j1";
-
-    httpClient.setConnectTimeout(5000);
-    httpClient.setTimeout(7000);
-    httpClient.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-    if (!httpClient.begin(url))
-    {
-        Serial.println("[weather] wttr begin failed");
-        return false;
-    }
-
-    int httpCode = httpClient.GET();
+    String payload;
+    NetWorkerHttpOptions net_opts;
+    net_opts.insecure_tls = false;
+    net_opts.connect_timeout_ms = 5000;
+    net_opts.timeout_ms = 7000;
+    net_opts.disable_redirects = true;
+    int httpCode = net_worker_http_get(url, &payload, &net_opts);
     if (httpCode != HTTP_CODE_OK)
     {
         Serial.printf("[weather] wttr failed: %d\n", httpCode);
-        httpClient.end();
         return false;
     }
 
     DynamicJsonDocument doc(8192);
-    DeserializationError err = deserializeJson(doc, httpClient.getString());
-    httpClient.end();
+    DeserializationError err = deserializeJson(doc, payload);
     if (err)
     {
         Serial.printf("[weather] wttr json parse failed: %s\n", err.c_str());

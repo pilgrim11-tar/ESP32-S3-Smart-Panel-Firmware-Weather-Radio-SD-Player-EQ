@@ -79,3 +79,29 @@
 - Старі backup-версії `doMain.cpp.*.bak`.
 - Legacy-файли `main.cpp1`, `mic_vendor.*`, `WeatherNow.*`.
 - Застарілі документи планування (`FINAL_ARCHITECTURE.md`, `PORTING_PLAN.md`).
+
+## Portable CLI scripts (no absolute paths)
+
+Use local scripts that auto-detect `arduino-cli` from:
+- `-ArduinoCli` parameter
+- `ARDUINO_CLI` environment variable
+- `arduino-cli` from PATH
+- common local fallback paths near project
+
+`build.ps1`:
+```powershell
+cd C:\project_backup\86switch_onoff_ai
+.\build.ps1
+```
+
+`flash.ps1` (default `COM5`):
+```powershell
+cd C:\project_backup\86switch_onoff_ai
+.\flash.ps1 -Port COM5
+```
+
+Optional overrides:
+```powershell
+.\build.ps1 -Fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=max_app,PSRAM=opi,USBMode=hwcdc,UploadMode=default,UploadSpeed=921600"
+.\flash.ps1 -Port COM6 -BuildPath .\build_out
+```
