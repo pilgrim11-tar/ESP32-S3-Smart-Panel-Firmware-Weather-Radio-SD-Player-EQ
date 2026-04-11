@@ -1,0 +1,20 @@
+# Build outputs
+/build/
+/build_test/
+/build_test_2011/
+/build_test_2011_max/
+
+# Generic temporary/build folders
+/build_*/
+
+# Local backups / temp
+*.bak
+*.tmp
+*.log
+*.elf
+*.bin
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
