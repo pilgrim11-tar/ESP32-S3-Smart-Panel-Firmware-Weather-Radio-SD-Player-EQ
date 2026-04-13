@@ -18,9 +18,18 @@ struct NetWorkerRequest
 
 QueueHandle_t s_net_queue = nullptr;
 TaskHandle_t s_net_task = nullptr;
+SemaphoreHandle_t s_http_mutex = nullptr;
 
 int perform_http_get(const NetWorkerRequest &req)
 {
+    if (s_http_mutex)
+    {
+        if (xSemaphoreTake(s_http_mutex, pdMS_TO_TICKS(15000)) != pdPASS)
+        {
+            return -1;
+        }
+    }
+
     HTTPClient http;
     http.setConnectTimeout(req.options.connect_timeout_ms);
     http.setTimeout(req.options.timeout_ms);
@@ -47,6 +56,10 @@ int perform_http_get(const NetWorkerRequest &req)
 
     if (!begin_ok)
     {
+        if (s_http_mutex)
+        {
+            xSemaphoreGive(s_http_mutex);
+        }
         return -1;
     }
 
@@ -63,6 +76,10 @@ int perform_http_get(const NetWorkerRequest &req)
         }
     }
     http.end();
+    if (s_http_mutex)
+    {
+        xSemaphoreGive(s_http_mutex);
+    }
     return code;
 }
 
@@ -102,6 +119,16 @@ bool net_worker_begin(UBaseType_t task_priority, BaseType_t core_id)
         }
     }
 
+    if (!s_http_mutex)
+    {
+        s_http_mutex = xSemaphoreCreateMutex();
+        if (!s_http_mutex)
+        {
+            Serial.println("[net] mutex create failed");
+            return false;
+        }
+    }
+
     if (!s_net_task)
     {
         const BaseType_t ok = xTaskCreatePinnedToCore(
@@ -126,7 +153,7 @@ bool net_worker_begin(UBaseType_t task_priority, BaseType_t core_id)
 
 bool net_worker_is_ready()
 {
-    return s_net_queue != nullptr && s_net_task != nullptr;
+    return s_net_queue != nullptr && s_net_task != nullptr && s_http_mutex != nullptr;
 }
 
 int net_worker_http_get(const String &url, String *response_body, const NetWorkerHttpOptions *options, uint32_t wait_timeout_ms)
@@ -163,4 +190,21 @@ int net_worker_http_get(const String &url, String *response_body, const NetWorke
 
     vSemaphoreDelete(req.done);
     return code;
+}
+
+bool net_worker_lock(uint32_t timeout_ms)
+{
+    if (!s_http_mutex)
+    {
+        return false;
+    }
+    return xSemaphoreTake(s_http_mutex, pdMS_TO_TICKS(timeout_ms)) == pdPASS;
+}
+
+void net_worker_unlock()
+{
+    if (s_http_mutex)
+    {
+        xSemaphoreGive(s_http_mutex);
+    }
 }

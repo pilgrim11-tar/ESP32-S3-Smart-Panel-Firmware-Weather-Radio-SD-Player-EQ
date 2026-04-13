@@ -1,5 +1,6 @@
 #include "doMain.h"
 #include "audio_visualizer.h"
+#include "app_settings.h"
 #include "doWifi.h"
 #include "flip_clock.h"
 #include "home_bg_sd_assets.h"
@@ -358,13 +359,6 @@ static constexpr uint32_t kTapListenCaptureRetryMs = 1400;
 static constexpr uint32_t kTapListenResultHoldMs = 15000;
 static constexpr uint32_t kTapListenTranscribeTimeoutMs = 22000;
 static const char *kTapListenWavPath = "/tap_cmd.wav";
-static constexpr uint32_t kMicReactiveMinVoiceMs = 260;
-static constexpr uint32_t kMicReactiveCooldownMs = 12000;
-static constexpr uint32_t kMicReactiveNightCooldownMs = 20000;
-static constexpr uint32_t kDisplaySleepIdleMs = 180000;
-static constexpr uint32_t kDisplaySleepWakeHoldMs = 4000;
-static constexpr uint8_t kDisplaySleepBrightness = 24;
-static constexpr uint8_t kSystemSoftOffBrightness = 34;
 static constexpr bool kDonorSoundWakeEnabled = true;
 static constexpr bool kCityNameGeocodingEnabled = false;
 static const char *const kPlayerMusicFolders[] = {
@@ -402,6 +396,7 @@ static void ensure_boot_black_screen();
 static void show_boot_black_screen();
 static void ensure_weather_task_running();
 static bool fetch_weather_once_now();
+static bool start_wifi_connect_task();
 static void donor_eq_uart_init();
 static void donor_eq_uart_push(const uint8_t *bars, size_t count, bool active);
 static SdVoiceMode current_voice_mode();
@@ -1764,8 +1759,16 @@ static bool getCityPositionByName(const String &cityName, float &latValue, float
         return false;
     }
 
-    DynamicJsonDocument doc(2048);
-    const DeserializationError err = deserializeJson(doc, payload);
+    DynamicJsonDocument filter(256);
+    filter["results"][0]["latitude"] = true;
+    filter["results"][0]["longitude"] = true;
+    filter["results"][0]["name"] = true;
+    filter["results"][0]["country"] = true;
+    filter["results"][0]["country_code"] = true;
+    filter["results"][0]["countryCode"] = true;
+
+    DynamicJsonDocument doc(1024);
+    const DeserializationError err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
     if (err)
     {
         return false;
@@ -1939,8 +1942,14 @@ static bool fetch_country_holiday_text(int year, int month, int day, const Strin
             return false;
         }
 
-        DynamicJsonDocument doc(24576);
-        const DeserializationError err = deserializeJson(doc, payload);
+        DynamicJsonDocument filter(256);
+        filter[0]["types"][0] = true;
+        filter[0]["date"] = true;
+        filter[0]["name"] = true;
+        filter[0]["localName"] = true;
+
+        DynamicJsonDocument doc(6144);
+        const DeserializationError err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
         if (err || !doc.is<JsonArray>())
         {
             return false;
@@ -2520,6 +2529,23 @@ static void ensure_weather_task_running()
     }
 }
 
+static bool start_wifi_connect_task()
+{
+    if (g_wifi_connect_state == 1)
+    {
+        return true;
+    }
+
+    g_wifi_connect_state = 1;
+    const BaseType_t task_ok = xTaskCreatePinnedToCore(connect_wifi_task, "connect_wifi_task", 4096, NULL, 0, NULL, 1);
+    if (task_ok != pdPASS)
+    {
+        g_wifi_connect_state = 0;
+        return false;
+    }
+    return true;
+}
+
 static void update_all_shell_labels()
 {
     update_home_labels();
@@ -2702,11 +2728,8 @@ void ui_sync_runtime()
     {
         if (s_wifi_reconnect_after_ms == 0 || now_ms >= s_wifi_reconnect_after_ms)
         {
-            g_wifi_connect_state = 1;
-            const BaseType_t taskOk = xTaskCreatePinnedToCore(connect_wifi_task, "connect_wifi_task", 4096, NULL, 0, NULL, 1);
-            if (taskOk != pdPASS)
+            if (!start_wifi_connect_task())
             {
-                g_wifi_connect_state = 0;
                 s_wifi_reconnect_after_ms = now_ms + 8000UL;
             }
             else
@@ -2851,11 +2874,11 @@ static void refresh_display_sleep_state()
         g_system_soft_off,
         g_alarm_ringing,
         mic_sound_above_wake_level(),
-        kDisplaySleepIdleMs,
-        kDisplaySleepWakeHoldMs,
+        app_settings::kDisplaySleepIdleMs,
+        app_settings::kDisplaySleepWakeHoldMs,
         g_backlight,
-        kDisplaySleepBrightness,
-        kSystemSoftOffBrightness);
+        app_settings::kDisplaySleepBrightness,
+        app_settings::kSystemSoftOffBrightness);
     if (level >= 0)
     {
         apply_runtime_backlight(static_cast<uint8_t>(level));
@@ -3734,7 +3757,7 @@ static void apply_brightness_slider()
 {
     uint8_t slider = (uint8_t)lv_slider_get_value(ui_Slider2);
     g_backlight = (uint8_t)map(slider, 0, 100, 20, 255);
-    apply_runtime_backlight(g_display_sleeping ? kDisplaySleepBrightness : g_backlight);
+        apply_runtime_backlight(g_display_sleeping ? app_settings::kDisplaySleepBrightness : g_backlight);
 }
 
 static void ui_event_volume_slider(lv_event_t *e)
@@ -6030,7 +6053,7 @@ static void set_system_soft_off(bool enabled)
     {
         if (enabled)
         {
-            apply_runtime_backlight(kSystemSoftOffBrightness);
+    apply_runtime_backlight(app_settings::kSystemSoftOffBrightness);
         }
         else
         {
@@ -6049,7 +6072,7 @@ static void set_system_soft_off(bool enabled)
         stop_all_audio_output();
         g_display_sleeping = false;
         g_display_wake_hold_until_ms = 0;
-        apply_runtime_backlight(kSystemSoftOffBrightness);
+    apply_runtime_backlight(app_settings::kSystemSoftOffBrightness);
         set_tap_listen_result("System off", false, 1800);
     }
     else
@@ -6058,7 +6081,7 @@ static void set_system_soft_off(bool enabled)
         g_last_user_activity_ms = millis();
         g_last_sound_activity_ms = g_last_user_activity_ms;
         g_display_sleeping = false;
-        g_display_wake_hold_until_ms = g_last_user_activity_ms + kDisplaySleepWakeHoldMs;
+        g_display_wake_hold_until_ms = g_last_user_activity_ms + app_settings::kDisplaySleepWakeHoldMs;
         apply_runtime_backlight(g_backlight);
         set_tap_listen_result("System on", false, 1800);
     }
@@ -6349,8 +6372,10 @@ void init_light()
     g_boot_wait_wifi_on_start = (ssid.length() > 0 && WiFi.status() != WL_CONNECTED);
     if (g_boot_wait_wifi_on_start && g_wifi_connect_state == 0)
     {
-        g_wifi_connect_state = 1;
-        xTaskCreatePinnedToCore(connect_wifi_task, "connect_wifi_task", 4096, NULL, 0, NULL, 1);
+        if (!start_wifi_connect_task())
+        {
+            g_boot_wait_wifi_on_start = false;
+        }
     }
     // Start NTP/weather only after Wi-Fi connects to preserve SRAM during WPA handshake.
     g_time_task_started = false;
@@ -6794,11 +6819,8 @@ void ui_event_Key_Ok(lv_event_t *e)
         {
             return;
         }
-        g_wifi_connect_state = 1;
-        const BaseType_t taskOk = xTaskCreatePinnedToCore(connect_wifi_task, "connect_wifi_task", 4096, NULL, 0, NULL, 1);
-        if (taskOk != pdPASS)
+        if (!start_wifi_connect_task())
         {
-            g_wifi_connect_state = 0;
             lv_label_set_text(ui_Label12, wifi_ui_status_connect_task_failed());
         }
     }
@@ -6980,8 +7002,16 @@ static bool fetch_open_meteo_weather(float latValue, float lonValue, String &sum
         return false;
     }
 
-    DynamicJsonDocument doc(8192);
-    DeserializationError err = deserializeJson(doc, payload);
+    DynamicJsonDocument filter(384);
+    filter["current_condition"][0]["temp_C"] = true;
+    filter["current_condition"][0]["windspeedKmph"] = true;
+    filter["current_condition"][0]["humidity"] = true;
+    filter["current_condition"][0]["weatherCode"] = true;
+    filter["current_condition"][0]["isdaytime"] = true;
+    filter["current_condition"][0]["weatherDesc"][0]["value"] = true;
+
+    DynamicJsonDocument doc(2048);
+    DeserializationError err = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
     if (err)
     {
         Serial.printf("[weather] wttr json parse failed: %s\n", err.c_str());

@@ -1,5 +1,6 @@
 ﻿#include "mic_remote_client.h"
 
+#include "net_worker.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <SD.h>
@@ -83,14 +84,11 @@ bool should_mark_offline() {
 }
 
 bool performGetOk(const String &url, int timeoutMs = kQuickRequestTimeoutMs) {
-  HTTPClient http;
-  http.setConnectTimeout(timeoutMs);
-  http.setTimeout(timeoutMs);
-  if (!http.begin(url)) {
-    return false;
-  }
-  const int code = http.GET();
-  http.end();
+  NetWorkerHttpOptions opts;
+  opts.insecure_tls = false;
+  opts.connect_timeout_ms = timeoutMs > 0 ? (uint32_t)timeoutMs : (uint32_t)kQuickRequestTimeoutMs;
+  opts.timeout_ms = opts.connect_timeout_ms;
+  const int code = net_worker_http_get(url, nullptr, &opts, opts.timeout_ms + 1200U);
   return code == HTTP_CODE_OK;
 }
 
@@ -127,20 +125,14 @@ void fetchStatus() {
     return;
   }
 
-  HTTPClient http;
   String url = buildUrl("/status");
-  http.setConnectTimeout(kStatusConnectTimeoutMs);
-  http.setTimeout(kStatusReadTimeoutMs);
-  if (!http.begin(url)) {
-    if (should_mark_offline()) {
-      setOffline("Mic donor begin failed");
-    }
-    return;
-  }
-
-  const int code = http.GET();
+  String payload;
+  NetWorkerHttpOptions opts;
+  opts.insecure_tls = false;
+  opts.connect_timeout_ms = kStatusConnectTimeoutMs;
+  opts.timeout_ms = kStatusReadTimeoutMs;
+  const int code = net_worker_http_get(url, &payload, &opts, (uint32_t)kStatusReadTimeoutMs + 1200U);
   if (code != HTTP_CODE_OK) {
-    http.end();
     if (should_mark_offline()) {
       setOffline("Mic donor HTTP fail");
     }
@@ -148,8 +140,7 @@ void fetchStatus() {
   }
 
   DynamicJsonDocument doc(kStatusJsonDocSize);
-  const DeserializationError err = deserializeJson(doc, http.getString());
-  http.end();
+  const DeserializationError err = deserializeJson(doc, payload);
   if (err != DeserializationError::Ok) {
     if (should_mark_offline()) {
       setOffline("Mic donor JSON fail");
@@ -298,56 +289,65 @@ bool mic_remote_client_download_wav(const char *sd_path) {
   }
 
   s_transfer_busy = true;
+  bool net_locked = net_worker_lock(12000);
+  if (!net_locked) {
+    s_transfer_busy = false;
+    return false;
+  }
+
+  bool ok = false;
 
   HTTPClient http;
-  http.setConnectTimeout(1800);
-  http.setTimeout(12000);
-  if (!http.begin(buildUrl("/listen/wav"))) {
-    s_transfer_busy = false;
-    return false;
-  }
-
-  const int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    http.end();
-    s_transfer_busy = false;
-    return false;
-  }
-
-  SD.remove(sd_path);
-  File out = SD.open(sd_path, FILE_WRITE);
-  if (!out) {
-    http.end();
-    s_transfer_busy = false;
-    return false;
-  }
-
-  WiFiClient *stream = http.getStreamPtr();
-  uint8_t buffer[1024];
-  int remaining = http.getSize();
-  size_t written = 0;
-  while (http.connected() && (remaining > 0 || remaining == -1)) {
-    const size_t available = stream->available();
-    if (!available) {
-      delay(1);
-      continue;
-    }
-    const int read = stream->readBytes(buffer, min<size_t>(available, sizeof(buffer)));
-    if (read <= 0) {
+  do {
+    http.setConnectTimeout(1800);
+    http.setTimeout(12000);
+    if (!http.begin(buildUrl("/listen/wav"))) {
       break;
     }
-    out.write(buffer, read);
-    written += static_cast<size_t>(read);
-    if (remaining > 0) {
-      remaining -= read;
-    }
-  }
 
-  out.close();
+    const int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+      break;
+    }
+
+    SD.remove(sd_path);
+    File out = SD.open(sd_path, FILE_WRITE);
+    if (!out) {
+      break;
+    }
+
+    WiFiClient *stream = http.getStreamPtr();
+    uint8_t buffer[1024];
+    int remaining = http.getSize();
+    size_t written = 0;
+    while (http.connected() && (remaining > 0 || remaining == -1)) {
+      const size_t available = stream->available();
+      if (!available) {
+        delay(1);
+        continue;
+      }
+      const int read = stream->readBytes(buffer, min<size_t>(available, sizeof(buffer)));
+      if (read <= 0) {
+        break;
+      }
+      out.write(buffer, read);
+      written += static_cast<size_t>(read);
+      if (remaining > 0) {
+        remaining -= read;
+      }
+    }
+
+    out.close();
+    ok = written > 44;
+  } while (false);
+
   http.end();
+  if (net_locked) {
+    net_worker_unlock();
+  }
   s_transfer_busy = false;
   fetchStatus();
-  return written > 44;
+  return ok;
 }
 
 bool mic_remote_client_online() {

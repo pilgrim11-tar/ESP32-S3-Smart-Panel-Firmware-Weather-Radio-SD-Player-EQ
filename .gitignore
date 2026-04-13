@@ -14,6 +14,11 @@
 *.elf
 *.bin
 
+# Local secrets/config (do not commit)
+/stt_config.h
+/stt_config.local.h
+/stt_config.*.local.h
+
 # OS/editor
 .DS_Store
 Thumbs.db
